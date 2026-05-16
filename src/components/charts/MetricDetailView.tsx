@@ -78,6 +78,18 @@ function ChartLegend({ metricType }: { metricType: MetricType }) {
           </View>
         );
       })}
+      {metricType === 'blood_pressure' && (
+        <View style={legendStyles.item}>
+          <View style={legendStyles.dashRow}>
+            <View style={[legendStyles.dash, { backgroundColor: '#A855F7' }]} />
+            <View style={[legendStyles.dash, { backgroundColor: '#A855F7' }]} />
+          </View>
+          <View>
+            <Text style={legendStyles.label}>Pulse</Text>
+            <Text style={legendStyles.range}>bpm · right axis</Text>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -100,6 +112,17 @@ const legendStyles = StyleSheet.create({
     height: 12,
     borderRadius: 6,
   },
+  dashRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    width: 14,
+  },
+  dash: {
+    width: 5,
+    height: 2,
+    borderRadius: 1,
+  },
   label: {
     color: '#E5E7EB',
     fontSize: 13,
@@ -120,6 +143,7 @@ const TEXT_PRIMARY = '#F9FAFB';
 const NEUTRAL_LINE = '#3B82F6';
 const SYS_COLOR = '#EF4444';
 const DIA_COLOR = '#F97316';
+const PULSE_COLOR = '#A855F7'; // distinct from sys/dia — purple, dashed line
 const NORMAL_BAND_COLOR = 'rgba(16, 185, 129, 0.12)';
 
 // Brush overview band styling
@@ -175,6 +199,27 @@ function normalBand(metricType: MetricType): { lo: number; hi: number } | null {
   }
 }
 
+function pointTooltipText(entry: MetricEntry, metricType: MetricType): string {
+  const lines: string[] = [];
+  lines.push(`${formatDate(entry.timestamp)} · ${formatTime(entry.timestamp)}`);
+  lines.push(valueDisplay(entry, metricType));
+  if (metricType === 'blood_pressure' && entry.pulse != null) {
+    lines.push(`Pulse: ${entry.pulse} bpm`);
+  }
+  if (metricType === 'blood_sugar' && entry.fasting != null) {
+    lines.push(entry.fasting ? 'Fasting' : 'Post-meal');
+  }
+  if (metricType === 'weight' && entry.body_fat != null) {
+    lines.push(`Body Fat: ${entry.body_fat}%`);
+  }
+  const status = statusFor(entry, metricType);
+  if (status !== 'neutral') {
+    lines.push(`Status: ${statusLabel(status)}`);
+  }
+  if (entry.notes) lines.push(`Notes: ${entry.notes}`);
+  return lines.join('\n');
+}
+
 function Chart({
   entries,
   metricType,
@@ -184,15 +229,17 @@ function Chart({
   metricType: MetricType;
   width: number;
 }) {
+  const isBP = metricType === 'blood_pressure';
   const height = 240;
   const padLeft = 56;
-  const padRight = 16;
-  const padTop = 14;
+  // Reserve a right gutter only on BP charts (for the pulse axis labels).
+  const padRight = isBP ? 56 : 16;
+  // Extra headroom on BP charts so the "BPM" caption doesn't collide with the top tick label.
+  const padTop = isBP ? 24 : 14;
   const padBottom = 36;
   const innerW = Math.max(1, width - padLeft - padRight);
   const innerH = Math.max(1, height - padTop - padBottom);
-
-  const isBP = metricType === 'blood_pressure';
+  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
   const primaryVals: number[] = [];
   const secondaryVals: number[] = [];
@@ -226,6 +273,8 @@ function Chart({
   const pad = range * 0.1;
   minV -= pad;
   maxV += pad;
+  // None of the tracked metrics can be negative — clamp the axis floor at 0.
+  if (minV < 0) minV = 0;
   const span = maxV - minV;
 
   const n = entries.length;
@@ -265,6 +314,42 @@ function Chart({
         .join(' ')
     : '';
 
+  // ---- Pulse (BP only) — separate right-side scale ----
+  const pulseVals: number[] = isBP
+    ? entries.map((e) => e.pulse).filter((p): p is number => p != null)
+    : [];
+  const hasPulse = pulseVals.length > 0;
+  let pMin = 0;
+  let pMax = 1;
+  let pSpan = 1;
+  if (hasPulse) {
+    pMin = Math.min(...pulseVals);
+    pMax = Math.max(...pulseVals);
+    if (pMin === pMax) {
+      pMin -= 5;
+      pMax += 5;
+    }
+    const pPad = (pMax - pMin) * 0.15;
+    pMin -= pPad;
+    pMax += pPad;
+    if (pMin < 0) pMin = 0;
+    pSpan = pMax - pMin;
+  }
+  const yAtPulse = (v: number) =>
+    padTop + innerH - ((v - pMin) / pSpan) * innerH;
+  const pulsePoints = hasPulse
+    ? entries
+        .map((e, i) => (e.pulse != null ? `${xAt(i)},${yAtPulse(e.pulse)}` : null))
+        .filter((p): p is string => p !== null)
+        .join(' ')
+    : '';
+  const pulseTicks: number[] = [];
+  if (hasPulse) {
+    for (let i = 0; i < tickCount; i++) {
+      pulseTicks.push(pMin + (pSpan * i) / (tickCount - 1));
+    }
+  }
+
   let bandRect: { x: number; y: number; w: number; h: number } | null = null;
   if (band) {
     const yHi = yAt(band.hi);
@@ -279,7 +364,35 @@ function Chart({
     };
   }
 
+  // Tooltip position: below the hovered point(s), clamped to the chart bounds.
+  // For BP we anchor below the lowest visible point so neither line gets covered.
+  const hoveredEntry = hoveredIdx != null ? entries[hoveredIdx] : null;
+  let anchorYBottom: number | null = null;
+  if (hoveredEntry) {
+    const ys: number[] = [];
+    if (isBP) {
+      if (hoveredEntry.systolic != null) ys.push(yAt(hoveredEntry.systolic));
+      if (hoveredEntry.diastolic != null) ys.push(yAt(hoveredEntry.diastolic));
+    } else if (hoveredEntry.value != null) {
+      ys.push(yAt(hoveredEntry.value));
+    }
+    if (ys.length > 0) anchorYBottom = Math.max(...ys);
+  }
+  const TOOLTIP_GAP = 12;
+  const TOOLTIP_MAX_W = 220;
+  const tooltipPos =
+    hoveredIdx != null && anchorYBottom != null
+      ? {
+          left: Math.max(
+            8,
+            Math.min(width - TOOLTIP_MAX_W - 8, xAt(hoveredIdx) - TOOLTIP_MAX_W / 2),
+          ),
+          top: Math.min(height - 80, anchorYBottom + TOOLTIP_GAP),
+        }
+      : null;
+
   return (
+    <View style={{ width, height, position: 'relative' }}>
     <Svg width={width} height={height}>
       {bandRect && bandRect.h > 0 && (
         <Rect
@@ -344,18 +457,85 @@ function Chart({
           opacity={0.6}
         />
       )}
+      {isBP && hasPulse && pulsePoints !== '' && (
+        <Polyline
+          points={pulsePoints}
+          fill="none"
+          stroke={PULSE_COLOR}
+          strokeWidth={1.6}
+          strokeDasharray="5,3"
+          opacity={0.85}
+        />
+      )}
+      {isBP &&
+        hasPulse &&
+        entries.map((e, i) =>
+          e.pulse != null ? (
+            <Circle
+              key={`pulse-${i}`}
+              cx={xAt(i)}
+              cy={yAtPulse(e.pulse)}
+              r={hoveredIdx === i ? 3.5 : 2}
+              fill={PULSE_COLOR}
+              stroke="#111827"
+              strokeWidth={0.5}
+            />
+          ) : null,
+        )}
+
+      {/* Right axis for pulse (BP charts only) */}
+      {isBP && hasPulse && (
+        <>
+          <Line
+            x1={padLeft + innerW}
+            y1={padTop}
+            x2={padLeft + innerW}
+            y2={padTop + innerH}
+            stroke={PULSE_COLOR}
+            strokeWidth={1}
+            opacity={0.5}
+          />
+          {pulseTicks.map((t, i) => {
+            const y = yAtPulse(t);
+            return (
+              <SvgText
+                key={`rtick-${i}`}
+                x={padLeft + innerW + 6}
+                y={y + 5}
+                fontSize={14}
+                fontWeight="500"
+                fill={PULSE_COLOR}
+                textAnchor="start"
+              >
+                {Math.round(t)}
+              </SvgText>
+            );
+          })}
+          <SvgText
+            x={padLeft + innerW + 6}
+            y={padTop - 10}
+            fontSize={11}
+            fontWeight="700"
+            fill={PULSE_COLOR}
+            textAnchor="start"
+          >
+            BPM
+          </SvgText>
+        </>
+      )}
 
       {entries.map((e, i) => {
         const v = isBP ? e.systolic : e.value;
         if (v == null) return null;
         const s = statusFor(e, metricType);
         const c = statusColor(s);
+        const isHover = hoveredIdx === i;
         return (
           <Circle
             key={`pt-${i}`}
             cx={xAt(i)}
             cy={yAt(v)}
-            r={2.5}
+            r={isHover ? 4 : 2.5}
             fill={c}
             stroke="#111827"
             strokeWidth={0.5}
@@ -369,12 +549,59 @@ function Chart({
               key={`dia-${i}`}
               cx={xAt(i)}
               cy={yAt(e.diastolic)}
-              r={1.8}
+              r={hoveredIdx === i ? 3 : 1.8}
               fill={DIA_COLOR}
               opacity={0.7}
             />
           ) : null
         )}
+
+      {/* Invisible larger hit-targets for hover/tap. Rendered last so they're on top.
+          For BP we use a single tall rectangle spanning both sys and dia points so
+          hover anywhere in that vertical column shows the (combined) tooltip. */}
+      {entries.map((e, i) => {
+        const primary = isBP ? e.systolic : e.value;
+        if (primary == null) return null;
+        const x = xAt(i);
+        const hoverProps = {
+          onPressIn: () => setHoveredIdx(i),
+          onPressOut: () => setHoveredIdx(null),
+          ...(Platform.OS === 'web'
+            ? ({
+                onMouseEnter: () => setHoveredIdx(i),
+                onMouseLeave: () => setHoveredIdx(null),
+                style: { cursor: 'pointer' },
+              } as object)
+            : {}),
+        };
+        if (isBP && e.diastolic != null) {
+          const ySys = yAt(e.systolic ?? 0);
+          const yDia = yAt(e.diastolic);
+          const top = Math.min(ySys, yDia) - 10;
+          const bot = Math.max(ySys, yDia) + 10;
+          return (
+            <Rect
+              key={`hit-${i}`}
+              x={x - 12}
+              y={top}
+              width={24}
+              height={bot - top}
+              fill="transparent"
+              {...hoverProps}
+            />
+          );
+        }
+        return (
+          <Circle
+            key={`hit-${i}`}
+            cx={x}
+            cy={yAt(primary)}
+            r={14}
+            fill="transparent"
+            {...hoverProps}
+          />
+        );
+      })}
 
       {xLabelIndices.map((idx, i) => {
         const e = entries[idx];
@@ -397,8 +624,42 @@ function Chart({
         );
       })}
     </Svg>
+    {tooltipPos && hoveredEntry && (
+      <View
+        pointerEvents="none"
+        style={[chartTooltipStyles.tooltip, tooltipPos]}
+      >
+        <Text style={chartTooltipStyles.text}>
+          {pointTooltipText(hoveredEntry, metricType)}
+        </Text>
+      </View>
+    )}
+    </View>
   );
 }
+
+const chartTooltipStyles = StyleSheet.create({
+  tooltip: {
+    position: 'absolute',
+    backgroundColor: 'rgba(17, 24, 39, 0.96)',
+    borderColor: '#374151',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    maxWidth: 220,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.4,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  text: {
+    color: '#F9FAFB',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+});
 
 // Secondary chart used for weight body-fat overlay.
 function BodyFatSubChart({
@@ -438,6 +699,8 @@ function BodyFatSubChart({
   const pad = range * 0.1;
   minV -= pad;
   maxV += pad;
+  // None of the tracked metrics can be negative — clamp the axis floor at 0.
+  if (minV < 0) minV = 0;
   const span = maxV - minV;
 
   const xAt = (i: number) =>
